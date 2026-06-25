@@ -87,7 +87,7 @@ export function fromScenario(scenario) {
         data.method = block.Params?.method || "GET";
         data.headers = block.Params?.headers || {};
         data.body = block.Params?.body || "";
-        data.resultVariable = block.Params?.resultVariable || "";
+        data.variables = block.Params?.variables || {};
         data.retryCount = block.Params?.retryCount || 0;
         break;
       default:
@@ -103,9 +103,22 @@ export function fromScenario(scenario) {
   const edges = [];
   scenario.Blocks.forEach((block) => {
     const from = block.Block_id;
-    block.Connections?.Out?.forEach((to) => {
-      edges.push({ id: `${from}-${to}`, source: from, target: to });
-    });
+    if (block.Connections?.OutEdges?.length) {
+      block.Connections.OutEdges.forEach((e) => {
+        const handleSuffix = e.sourceHandle ? `-${e.sourceHandle}` : "";
+        edges.push({
+          id: e.id || `${from}${handleSuffix}-${e.target}`,
+          source: from,
+          target: e.target,
+          ...(e.sourceHandle != null ? { sourceHandle: e.sourceHandle } : {}),
+          ...(e.targetHandle != null ? { targetHandle: e.targetHandle } : {}),
+        });
+      });
+    } else {
+      block.Connections?.Out?.forEach((to) => {
+        edges.push({ id: `${from}-${to}`, source: from, target: to });
+      });
+    }
   });
   return { nodes, edges };
 }
@@ -113,11 +126,17 @@ export function fromScenario(scenario) {
 export function toScenario(nodes, edges) {
   const inMap = {};
   const outMap = {};
+  const outEdgesMap = {};
   edges.forEach((edge) => {
     if (!outMap[edge.source]) outMap[edge.source] = [];
     outMap[edge.source].push(edge.target);
     if (!inMap[edge.target]) inMap[edge.target] = [];
     inMap[edge.target].push(edge.source);
+    if (!outEdgesMap[edge.source]) outEdgesMap[edge.source] = [];
+    const outEdge = { id: edge.id, target: edge.target };
+    if (edge.sourceHandle != null) outEdge.sourceHandle = edge.sourceHandle;
+    if (edge.targetHandle != null) outEdge.targetHandle = edge.targetHandle;
+    outEdgesMap[edge.source].push(outEdge);
   });
   const blocks = nodes.map((node) => {
     const type = scenarioTypeFromNodeType(node.type);
@@ -144,8 +163,10 @@ export function toScenario(nodes, edges) {
         params.method = node.data.method || "GET";
         params.headers = node.data.headers || {};
         params.body = node.data.body || "";
-        params.resultVariable = node.data.resultVariable || "";
         params.retryCount = node.data.retryCount || 0;
+        params.variables = (node.data.variables && typeof node.data.variables === "object")
+          ? node.data.variables
+          : {};
         break;
       default:
         break;
@@ -157,14 +178,17 @@ export function toScenario(nodes, edges) {
       X: Math.round(node.position.x),
       Y: Math.round(node.position.y),
       Params: params,
-      Connections: { In: inMap[node.id] || [], Out: outMap[node.id] || [] },
+      Connections: {
+        In: inMap[node.id] || [],
+        Out: outMap[node.id] || [],
+        OutEdges: outEdgesMap[node.id] || [],
+      },
     };
   });
   const startNode = nodes.find((n) => n.type === "start");
   const finalNode = nodes.find((n) => n.type === "final");
   return {
     BotName: "Bot",
-    Token: "",
     Start: startNode ? startNode.id : "",
     Final: finalNode ? finalNode.id : "",
     Blocks: blocks,

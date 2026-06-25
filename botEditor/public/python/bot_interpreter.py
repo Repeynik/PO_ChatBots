@@ -23,9 +23,32 @@ class BotInterpreter:
         self.storage = storage if storage else MemoryStorage()
         
         self.blocks = {b["Block_id"]: b for b in bot_model["Blocks"]}
+        top_edges = bot_model.get("Edges", [])
+        if top_edges:
+            for block in self.blocks.values():
+                conns = block.get("Connections", {})
+                if not conns.get("OutEdges"):
+                    src = block["Block_id"]
+                    conns["OutEdges"] = [
+                        {"id": e.get("id", ""), "target": e["target"],
+                         **( {"sourceHandle": e["sourceHandle"]} if e.get("sourceHandle") else {} )}
+                        for e in top_edges if e.get("source") == src
+                    ]
         
         # Глобальные переменные (конфигурация)
-        self.global_vars = {v["name"]: v.get("default", "") for v in self.model.get("GlobalVariables", [])}
+        raw_vars = self.model.get("GlobalVariables", [])
+        self.global_vars = {}
+        for v in raw_vars:
+            if isinstance(v, dict):
+                name = v.get("name", "").strip()
+                value = v.get("default", v.get("value", ""))
+                if name:
+                    self.global_vars[name] = value
+            elif isinstance(v, str) and "=" in v:
+                name, _, value = v.partition("=")
+                if name.strip():
+                    self.global_vars[name.strip()] = value.strip()
+        print(f"[BotInterpreter] global_vars loaded: {self.global_vars}")
 
         self.block_handlers = {
             "start": self._handle_start_block,
@@ -34,7 +57,7 @@ class BotInterpreter:
             "choice": self._handle_choice_block,
             "final": self._handle_final_block,
             "condition": self._handle_condition_block,
-            "apiRequest": self._handle_api_request_block
+            "api": self._handle_api_request_block
         }
 
     # -------------------------
@@ -242,15 +265,19 @@ class BotInterpreter:
             var_name = block["Params"]["var"]
             session["variables"][var_name] = selected["value"]
 
-            # Определяем, куда идти (manual switch)
+            out_edges = block["Connections"].get("OutEdges", [])
+            if out_edges:
+                target = next((e["target"] for e in out_edges if str(e.get("sourceHandle")) == str(selected["id"])), None)
+                if target:
+                    session["current_block"] = target
+                    return "manual_switch"
+
             idx = options.index(selected)
             out_conns = block["Connections"].get("Out", [])
-            
             if idx < len(out_conns):
                 session["current_block"] = out_conns[idx]
                 return "manual_switch"
             else:
-                # Ветка не подключена
                 logger.warning(f"Choice block {block['Block_id']}: branch {idx} not connected")
                 return "break"
 
@@ -271,72 +298,168 @@ class BotInterpreter:
         """
         Вычисляет условие и меняет current_block.
         """
-        condition_expr = block["Params"].get("condition", "False")
+        condition_expr = block["Params"].get("expression", block["Params"].get("condition", "False"))
         try:
-            # Безопаснее использовать simpleeval, но пока eval
-            # Обязательно преобразуем переменные в нужные типы перед этим, если надо
             res = eval(condition_expr, {"__builtins__": {}}, session["variables"])
         except Exception as e:
             logger.error(f"Condition error user {user_id}: {e}")
             res = False
 
+        out_edges = block["Connections"].get("OutEdges", [])
+        if out_edges:
+            handle = "true" if res else "false"
+            target = next((e["target"] for e in out_edges if str(e.get("sourceHandle", "")).lower() == handle), None)
+            if target:
+                session["current_block"] = target
+                return "manual_switch"
+
         out_conns = block["Connections"].get("Out", [])
-        
-        # Индекс: 0 - True, 1 - False
         idx = 0 if res else 1
-        
         if idx < len(out_conns):
             session["current_block"] = out_conns[idx]
             return "manual_switch"
-        
-        return "break" # Если ветка не подключена
+
+        return "break"
 
     async def _handle_api_request_block(self, block, user_id, session, input_data):
         """
-        Асинхронный HTTP запрос.
+        Асинхронный HTTP запрос с поддержкой переменных.
+        Использует JavaScript fetch в Pyodide для обхода SSL проблем.
         """
         params = block["Params"]
-        url = params.get("url")
+        
+        # Подставляем переменные
+        url = self._format_text(params.get("url", ""), session["variables"])
+        print(f"[BotInterpreter] API block URL after substitution: {url}")
         method = params.get("method", "GET").upper()
-        headers = params.get("headers", {})
-        body = params.get("body", {})
-        var_mapping = params.get("variables", {}) # {"resp_field": "bot_var"}
+        
+        # Заголовки
+        headers_raw = params.get("headers", {})
+        headers = {}
+        for key, value in headers_raw.items():
+            if isinstance(value, str):
+                headers[key] = self._format_text(value, session["variables"])
+            else:
+                headers[key] = value
+        
+        # Тело запроса
+        body_raw = params.get("body", {})
+        if isinstance(body_raw, str):
+            try:
+                import json
+                body_raw = json.loads(body_raw)
+            except:
+                body_raw = {}
+        body = self._substitute_in_dict(body_raw, session["variables"])
+        
+        # Маппинг переменных
+        var_mapping = params.get("variables", {})
+        print(f"[BotInterpreter] var_mapping raw: type={type(var_mapping).__name__} value={var_mapping!r}")
+        # Если variables пришли строкой — распарсим
+        if isinstance(var_mapping, str):
+            try:
+                import json as _j
+                var_mapping = _j.loads(var_mapping)
+            except Exception:
+                var_mapping = {}
+        var_mapping_substituted = {}
+        for json_field, var_name in var_mapping.items():
+            var_mapping_substituted[json_field] = self._format_text(var_name, session["variables"])
 
         if not url:
+            logger.warning(f"API block {block['Block_id']}: URL is empty")
             return "break"
 
-        status = 0
-        resp_data = {}
-
         try:
-            # Используем aiohttp для асинхронности
-            async with aiohttp.ClientSession() as client:
-                if method == "GET":
-                    async with client.get(url, headers=headers) as resp:
-                        status = resp.status
-                        if "application/json" in resp.headers.get("Content-Type", ""):
-                            resp_data = await resp.json()
-                        else:
-                            # Можно сохранить text если нужно
-                            pass
-                elif method == "POST":
-                    async with client.post(url, json=body, headers=headers) as resp:
-                        status = resp.status
-                        if "application/json" in resp.headers.get("Content-Type", ""):
-                            resp_data = await resp.json()
-
-            # Успех (2xx) или Провал
-            is_success = 200 <= status < 300
+            # Проверяем, в Pyodide ли мы
+            try:
+                from js import fetch, JSON, Headers
+                import asyncio
+                is_pyodide = True
+            except ImportError:
+                is_pyodide = False
             
-            # Сохраняем переменные (только при успехе, или всегда - зависит от логики)
-            if is_success:
-                for json_field, var_name in var_mapping.items():
-                    # Поддержка вложенности типа "user.id" не реализована для простоты, 
-                    # но тут можно доставать значения из resp_data
-                    if json_field in resp_data:
-                        session["variables"][var_name] = resp_data[json_field]
+            if is_pyodide:
+                # Используем JavaScript fetch
+                fetch_options = {
+                    "method": method,
+                    "headers": headers,
+                    "mode": "cors",
+                }
+                
+                # Добавляем тело для POST/PUT
+                if method in ["POST", "PUT", "PATCH"] and body:
+                    import json
+                    fetch_options["body"] = json.dumps(body)
+                    if "Content-Type" not in headers:
+                        fetch_options["headers"]["Content-Type"] = "application/json"
+                
+                # Выполняем запрос через JS fetch
+                response = await fetch(url, fetch_options)
+                status = response.status
+                
+                # Получаем ответ через text+json.loads — надёжнее to_py() в Pyodide
+                import json as _json
+                js_text = await response.text()
+                raw_text = str(js_text)
+                try:
+                    resp_data = _json.loads(raw_text)
+                except Exception:
+                    resp_data = {"text": raw_text}
+                    
+            else:
+                # Используем aiohttp (серверная версия)
+                import aiohttp
+                async with aiohttp.ClientSession() as client:
+                    if method == "GET":
+                        async with client.get(url, headers=headers) as resp:
+                            status = resp.status
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "application/json" in content_type:
+                                resp_data = await resp.json()
+                            else:
+                                resp_data = {"text": await resp.text()}
+                    elif method == "POST":
+                        async with client.post(url, json=body, headers=headers) as resp:
+                            status = resp.status
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "application/json" in content_type:
+                                resp_data = await resp.json()
+                            else:
+                                resp_data = {"text": await resp.text()}
+                    elif method == "PUT":
+                        async with client.put(url, json=body, headers=headers) as resp:
+                            status = resp.status
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "application/json" in content_type:
+                                resp_data = await resp.json()
+                            else:
+                                resp_data = {"text": await resp.text()}
+                    elif method == "DELETE":
+                        async with client.delete(url, headers=headers) as resp:
+                            status = resp.status
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "application/json" in content_type:
+                                resp_data = await resp.json()
+                            else:
+                                resp_data = {"text": await resp.text()}
+                    else:
+                        logger.error(f"Unsupported method: {method}")
+                        return "break"
 
-            # Выбираем выход: 0 - Success, 1 - Fail
+            # Успех или провал
+            is_success = 200 <= status < 300
+            print(f"[BotInterpreter] API status={status} is_success={is_success} resp_data keys={list(resp_data.keys()) if isinstance(resp_data, dict) else type(resp_data)}")
+
+            # Сохраняем переменные
+            if is_success:
+                for json_field, var_name in var_mapping_substituted.items():
+                    value = self._get_nested_value(resp_data, json_field)
+                    print(f"[BotInterpreter] mapping {json_field!r} -> {var_name!r} = {value!r}")
+                    if value is not None:
+                        session["variables"][var_name] = value
+
+            # Выбираем выход
             out_idx = 0 if is_success else 1
             out_conns = block["Connections"].get("Out", [])
             
@@ -345,14 +468,60 @@ class BotInterpreter:
                 return "manual_switch"
 
         except Exception as e:
-            logger.error(f"API Request failed: {e}")
+            logger.error(f"API Request failed for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            
             # Пытаемся пойти по ветке Fail
             out_conns = block["Connections"].get("Out", [])
             if len(out_conns) > 1:
                 session["current_block"] = out_conns[1]
                 return "manual_switch"
+            return "break"
 
         return "break"
+
+    def _get_nested_value(self, data: dict, path: str):
+        """
+        Получает значение из вложенного словаря по пути вида "user.id" или "weather.0.temp"
+        """
+        if not path or not data:
+            return None
+        
+        keys = path.split(".")
+        current = data
+        
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            elif isinstance(current, list) and key.isdigit():
+                idx = int(key)
+                if idx < len(current):
+                    current = current[idx]
+                else:
+                    return None
+            else:
+                return None
+        
+        return current
+
+    def _substitute_in_dict(self, obj, variables: Dict[str, Any]):
+        """
+        Рекурсивно подставляет переменные во все строки внутри dict/list.
+        """
+        if isinstance(obj, dict):
+            result = {}
+            for key, value in obj.items():
+                # Подставляем переменные в ключи (если они строки)
+                new_key = self._format_text(key, variables) if isinstance(key, str) else key
+                result[new_key] = self._substitute_in_dict(value, variables)
+            return result
+        elif isinstance(obj, list):
+            return [self._substitute_in_dict(item, variables) for item in obj]
+        elif isinstance(obj, str):
+            return self._format_text(obj, variables)
+        else:
+            return obj
 
     async def _handle_final_block(self, block, user_id, session, input_data):
         msg = "Диалог завершён. Результаты:\n"
@@ -371,6 +540,9 @@ class BotInterpreter:
             placeholder = "${" + k + "}"
             if placeholder in text:
                 text = text.replace(placeholder, str(v))
+        if "${" in text:
+            print(f"[BotInterpreter] WARNING: unresolved placeholder in text. Available vars: {list(variables.keys())}")
+            logger.warning(f"Unresolved placeholder remains after substitution. Available vars: {list(variables.keys())}")
         return text
 
     def _cast_type(self, value, expected_type):
